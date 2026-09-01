@@ -1,352 +1,409 @@
-# ============================================================
-# KOBIS 일별 박스오피스 조회 앱 (Streamlit)
-# - 달력에서 날짜를 고르면 그날의 박스오피스를 표/카드/그래프로 보여 줍니다.
-# - 고를 수 있는 가장 늦은 날짜는 '어제'(한국 시간 기준)입니다.
-# ============================================================
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
-# ── 1) 필요한 도구(라이브러리) 불러오기 ──────────────────────
-import datetime as dt              # 날짜/시간 계산용
-from zoneinfo import ZoneInfo      # '한국 시간대'를 정확히 다루기 위한 도구 (파이썬 3.9+)
-
-import requests                    # 인터넷으로 API를 호출할 때 사용
-import pandas as pd                # 표(데이터프레임)를 다루는 도구
-import streamlit as st             # 웹 화면을 만들어 주는 도구
-
-
-# ── 2) 페이지 기본 설정 ──────────────────────────────────────
-st.set_page_config(page_title="박스오피스 조회", page_icon="🎬", layout="wide")
-
-st.title("🎬 일별 박스오피스 조회")
-st.caption("자료 출처: 영화진흥위원회(KOBIS) 오픈API")
-
-
-# ── 3) 상수(값이 변하지 않는 이름표) 정의 ────────────────────
-API_URL = (
-    "https://www.kobis.or.kr/kobisopenapi/webservice/rest/"
-    "boxoffice/searchDailyBoxOfficeList.json"
+# =============================================================
+# 기본 설정
+# =============================================================
+st.set_page_config(
+    page_title="영화 데이터 그래프 도감 1 - 시간",
+    page_icon="🎬",
+    layout="wide",
 )
 
-# 한국 표준시(KST). 배포 서버는 보통 UTC라서 반드시 변환이 필요합니다.
-KST = ZoneInfo("Asia/Seoul")
-
-# KOBIS 오픈API가 제공하는 가장 이른 날짜(2004-01-01)
-MIN_DATE = dt.date(2004, 1, 1)
-
-# 누적관객 '100만 명' 기준선 (트로피를 붙일 기준)
-MILLION = 1_000_000
+DATA_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/kobis_daily.csv"
 
 
-# ── 4) '어제' 날짜를 한국 시간 기준으로 계산하는 함수 ────────
-def get_yesterday_kst() -> dt.date:
-    """
-    한국 시간 기준 '어제' 날짜를 date 객체로 돌려줍니다.
+# =============================================================
+# 데이터 불러오기
+# =============================================================
+@st.cache_data
+def load_data(url: str) -> pd.DataFrame:
+    """KOBIS 일별 박스오피스 데이터를 불러오고 날짜 열을 날짜형으로 변환한다."""
+    df = pd.read_csv(url)
 
-    왜 이렇게 하나요?
-    - 서버 시계가 UTC이면 한국보다 9시간 느립니다.
-      예) 한국 6월 2일 오전 5시  →  서버(UTC)는 6월 1일 오후 8시
-      그래서 서버 시각으로 '어제'를 구하면 하루가 어긋날 수 있습니다.
-    - KOBIS는 '오늘' 자료를 아직 집계하지 않으므로 어제까지만 고를 수 있게 합니다.
-    """
-    now_kst = dt.datetime.now(KST)                 # 지금 이 순간을 '한국 시간'으로
-    return now_kst.date() - dt.timedelta(days=1)   # 하루 빼기
+    # 날짜 열 이름 찾기 (파일에 따라 '날짜' 또는 'date' 등일 수 있어 안전하게 처리)
+    date_col = None
+    for c in df.columns:
+        if str(c).strip() in ("날짜", "date", "일자", "Date"):
+            date_col = c
+            break
+    if date_col is None:
+        date_col = df.columns[0]  # 첫 번째 열을 날짜로 가정
 
-
-# ── 5) 문자열 숫자를 진짜 숫자로 바꾸는 함수 ─────────────────
-def to_int(value) -> int:
-    """
-    KOBIS는 관객수·순위증감 같은 값을 '문자열'로 보내 줍니다. (예: "123456", "-2")
-    가끔 "1,234" 처럼 쉼표가 섞이거나 빈 값이 올 수 있으므로 안전하게 정수로 바꿉니다.
-    실패하면 0을 돌려줍니다.
-    """
-    try:
-        return int(str(value).replace(",", "").strip())
-    except (ValueError, AttributeError, TypeError):
-        return 0
-
-
-# ── 6) 순위 증감(rankInten)을 화살표 글자로 바꾸는 함수 ──────
-def format_rank_inten(inten: int) -> str:
-    """
-    전날 대비 순위 증감을 보기 좋은 글자로 바꿉니다.
-
-    rankInten 값의 뜻
-      양수(+2) : 순위가 2계단 '올랐다'  → 빨간 위 화살표 🔺
-      음수(-3) : 순위가 3계단 '내렸다'  → 파란 아래 화살표 🔻
-      0        : 변동 없음              → 가로줄 ➖
-
-    ※ abs()는 절댓값(부호를 뗀 크기)을 구하는 함수입니다.
-       -3의 절댓값은 3이므로 "🔻 3"처럼 깔끔하게 표시됩니다.
-    """
-    if inten > 0:
-        return f"🔺 {inten}"      # 🔺 = 빨간 위쪽 삼각형(상승)
-    elif inten < 0:
-        return f"🔻 {abs(inten)}"  # 🔻 = 파란 아래쪽 삼각형(하락)
-    else:
-        return "➖ 0"              # 변동 없음
-
-
-# ── 7) 누적관객 100만 돌파 시 트로피를 붙이는 함수 ───────────
-def decorate_movie_name(name: str, audi_acc: int) -> str:
-    """
-    누적관객이 100만 명 이상이면 영화명 앞에 트로피 이모지를 붙입니다.
-    (100만은 흔히 '흥행 성공'의 기준선으로 이야기됩니다.)
-    """
-    if audi_acc >= MILLION:
-        return f"🏆 {name}"
-    return name
-
-
-# ── 8) API를 호출하는 함수 (1시간 캐시) ──────────────────────
-# @st.cache_data : 같은 인자(target_dt)로 다시 부르면 인터넷에 다시 나가지 않고
-#                  저장해 둔 결과를 그대로 돌려줍니다.
-# ttl=3600       : 3600초 = 1시간 동안만 기억합니다.
-@st.cache_data(ttl=3600, show_spinner="박스오피스 자료를 불러오는 중입니다...")
-def fetch_boxoffice(target_dt: str, api_key: str) -> dict:
-    """
-    KOBIS 일별 박스오피스 API를 호출해 결과를 사전(dict)으로 돌려줍니다.
-
-    반환 형태(항상 "status" 열쇠를 가집니다):
-      {"status": "OK",    "data": [영화 목록]}      # 성공
-      {"status": "EMPTY"}                           # 목록이 비어 있음(집계 전)
-      {"status": "ERROR", "error": "안내문"}        # 그 밖의 오류
-    """
-    params = {"key": api_key, "targetDt": target_dt}
-
-    # (1) 네트워크 단계에서 생길 수 있는 문제를 try/except로 감쌉니다.
-    try:
-        response = requests.get(API_URL, params=params, timeout=10)  # 10초 안에 응답 없으면 포기
-        response.raise_for_status()   # 상태코드가 400/500이면 예외 발생
-        result = response.json()      # 받은 JSON 글자를 파이썬 사전으로 변환
-    except requests.exceptions.Timeout:
-        return {"status": "ERROR", "error": "요청 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요."}
-    except requests.exceptions.RequestException as e:
-        return {"status": "ERROR", "error": f"네트워크 요청에 실패했습니다. (자세한 내용: {e})"}
-    except ValueError:
-        # json() 변환 실패 = 응답이 JSON이 아님 (점검 페이지 등이 올 때)
-        return {"status": "ERROR", "error": "응답을 해석할 수 없습니다. KOBIS 서비스 점검 중일 수 있습니다."}
-
-    # (2) 인증키가 틀려도 상태코드는 200입니다. 대신 faultInfo 상자가 옵니다.
-    if "faultInfo" in result:
-        fault = result.get("faultInfo", {})
-        message = fault.get("message", "알 수 없는 오류")
-        code = fault.get("errorCode", "-")
-        return {"status": "ERROR", "error": f"KOBIS가 오류를 돌려주었습니다. (코드 {code}) {message}"}
-
-    # (3) 정상 응답이면 boxOfficeResult > dailyBoxOfficeList 순서로 꺼냅니다.
-    box_office_result = result.get("boxOfficeResult", {})
-    movie_list = box_office_result.get("dailyBoxOfficeList", [])
-
-    # (4) 목록이 비어 있는 경우 → 아직 집계되지 않은 날짜
-    if not movie_list:
-        return {"status": "EMPTY"}
-
-    return {"status": "OK", "data": movie_list}
-
-
-# ── 9) 받아온 목록을 표(DataFrame)로 정리하는 함수 ───────────
-def build_dataframe(movie_list: list) -> pd.DataFrame:
-    """
-    영화 목록(사전들의 리스트)을 표로 바꾸고,
-    문자열로 온 숫자들을 진짜 숫자 자료형으로 바꿔 줍니다.
-    또한 화살표·트로피 같은 '보여 주기용' 열도 함께 만듭니다.
-    """
-    rows = []   # 한 줄씩 담아 둘 빈 상자
-    for movie in movie_list:
-        # 먼저 문자열 → 숫자로 변환
-        audi_acc = to_int(movie.get("audiAcc"))     # 누적관객
-        inten = to_int(movie.get("rankInten"))      # 순위 증감
-        raw_name = movie.get("movieNm", "-")        # 원래 영화명
-
-        rows.append({
-            "순위": to_int(movie.get("rank")),
-            "증감": format_rank_inten(inten),                    # 표에 보여 줄 화살표 글자
-            "영화명": decorate_movie_name(raw_name, audi_acc),   # 트로피가 붙을 수 있는 이름
-            "개봉일": movie.get("openDt", "-"),
-            "관객수": to_int(movie.get("audiCnt")),
-            "누적관객": audi_acc,
-            "스크린수": to_int(movie.get("scrnCnt")),
-            "상영횟수": to_int(movie.get("showCnt")),
-            # 아래 두 열은 계산·정렬용 '숨은 열'입니다. 화면 표에는 넣지 않습니다.
-            "_원래영화명": raw_name,
-            "_증감숫자": inten,
-        })
-
-    df = pd.DataFrame(rows)                              # 리스트 → 표로 변환
-    df = df.sort_values("순위").reset_index(drop=True)   # 순위 오름차순 정렬
-    return df
-
-
-# ============================================================
-#                      화면 그리기 (실행 부분)
-# ============================================================
-
-# ── 10) 비밀 금고(secrets)에서 인증키 꺼내기 ─────────────────
-# 인증키를 코드에 직접 적으면 깃허브에 공개되어 위험합니다.
-# 스트림릿 클라우드 > App settings > Secrets 에 아래처럼 저장하세요.
-#   KOBIS_KEY = "여기에_발급받은_인증키"
-try:
-    API_KEY = st.secrets["KOBIS_KEY"]
-except (KeyError, FileNotFoundError):
-    st.error("🔑 인증키를 찾을 수 없습니다.")
-    st.markdown(
-        """
-        **이렇게 확인해 보세요.**
-        1. 스트림릿 클라우드 화면 오른쪽 아래 **⋮ → Settings → Secrets** 로 들어갑니다.
-        2. 아래 한 줄을 그대로 넣고 저장합니다. (따옴표 포함)
-           ```
-           KOBIS_KEY = "발급받은_인증키"
-           ```
-        3. 내 컴퓨터에서 실행 중이라면 프로젝트 폴더에
-           `.streamlit/secrets.toml` 파일을 만들고 같은 내용을 적습니다.
-        4. 저장 후 앱을 다시 실행(Reboot)합니다.
-        """
+    # 20240101 같은 8자리 숫자를 진짜 날짜(datetime)로 변환
+    df[date_col] = pd.to_datetime(
+        df[date_col].astype(str).str.replace("-", "", regex=False).str.strip(),
+        format="%Y%m%d",
+        errors="coerce",
     )
-    st.stop()   # 인증키가 없으면 여기서 멈춤
+    df = df.rename(columns={date_col: "날짜"})
+    df = df.dropna(subset=["날짜"])
+
+    # 숫자 열은 숫자형으로 정리
+    for col in ["순위", "일관객", "누적관객", "스크린수", "상영횟수"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            )
+
+    return df.sort_values("날짜").reset_index(drop=True)
 
 
-# ── 11) 달력에서 날짜 고르기 ─────────────────────────────────
-yesterday = get_yesterday_kst()   # 고를 수 있는 가장 늦은 날짜
+df = load_data(DATA_URL)
 
+
+# =============================================================
+# 공통 도구 : 그래프 아래 설명 문구 자리
+# =============================================================
+def insight_box(text: str = ""):
+    """그래프마다 '이 그래프로 알 수 있는 것' 한 문장을 넣는 자리."""
+    st.markdown("**💡 이 그래프로 알 수 있는 것**")
+    st.info(text if text else "여기에 한 문장으로 정리해 보세요.")
+
+
+# =============================================================
+# 사이드바 : 데이터 요약
+# =============================================================
 with st.sidebar:
-    st.header("📅 날짜 선택")
+    st.header("📦 데이터 정보")
+    st.write(f"- 행 개수 : **{len(df):,}행**")
+    st.write(f"- 기간 : **{df['날짜'].min().date()} ~ {df['날짜'].max().date()}**")
+    st.write(f"- 영화 수 : **{df['영화명'].nunique():,}편**")
+    with st.expander("원본 데이터 미리 보기"):
+        st.dataframe(df.head(20), use_container_width=True)
 
-    # st.date_input : 달력 위젯
-    #   value     : 처음 화면에 보일 기본 날짜 (어제)
-    #   min_value : 고를 수 있는 가장 이른 날짜
-    #   max_value : 고를 수 있는 가장 늦은 날짜 → '어제'로 막아 둡니다.
-    selected_date = st.date_input(
-        "조회할 날짜를 고르세요",
-        value=yesterday,
-        min_value=MIN_DATE,
-        max_value=yesterday,
-        format="YYYY-MM-DD",
+
+# =============================================================
+# 제목
+# =============================================================
+st.title("🎬 영화 데이터 그래프 도감 1 - 시간")
+st.caption("1년치(365일) 일별 박스오피스 10위권 기록으로 '시간에 따른 변화'를 살펴봅니다.")
+st.divider()
+
+
+# =============================================================
+# 구역 1 : 영화 한 편의 일별 관객수 변화 (선 그래프)
+# =============================================================
+def section_1_daily_audience(df: pd.DataFrame):
+    st.header("1️⃣ 한 영화의 일별 관객수 변화")
+    st.write("영화를 하나 고르면, 그 영화가 박스오피스 10위권에 있었던 날들의 일관객 수를 선 그래프로 보여 줍니다.")
+
+    # 관객이 많은 영화가 위로 오도록 정렬해서 고르기 쉽게 만들기
+    movie_order = (
+        df.groupby("영화명")["일관객"].sum().sort_values(ascending=False).index.tolist()
+    )
+    movie = st.selectbox("영화를 선택하세요", movie_order, index=0, key="sec1_movie")
+
+    one = df[df["영화명"] == movie].sort_values("날짜")
+
+    fig = px.line(
+        one,
+        x="날짜",
+        y="일관객",
+        markers=True,
+        title=f"「{movie}」 날짜별 일관객 수",
+        labels={"날짜": "날짜", "일관객": "일별 관객수(명)"},
+    )
+    fig.update_traces(
+        hovertemplate="날짜: %{x|%Y-%m-%d}<br>관객수: %{y:,.0f}명<extra></extra>"
+    )
+    fig.update_layout(hovermode="x unified", yaxis_tickformat=",")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 간단한 요약 지표
+    c1, c2, c3 = st.columns(3)
+    c1.metric("10위권 진입 일수", f"{len(one):,}일")
+    c2.metric("최고 일관객", f"{one['일관객'].max():,.0f}명")
+    c3.metric("최고 기록일", f"{one.loc[one['일관객'].idxmax(), '날짜'].date()}")
+
+    insight_box("예) 개봉 직후 관객수가 가장 높고, 이후 점점 줄어드는 모습을 볼 수 있다.")
+
+
+section_1_daily_audience(df)
+st.divider()
+
+
+# =============================================================
+# 구역 2 : 일관객 합계 TOP 5 영화 비교 (여러 선 그래프)
+# =============================================================
+def section_2_top5_compare(df: pd.DataFrame):
+    st.header("2️⃣ 관객수 TOP 5 영화의 일관객 비교")
+    st.write(
+        "이 기간 동안 **일관객 합계가 가장 큰 5편**을 골라, 날짜별 일관객 변화를 한 그래프에 겹쳐 그렸습니다. "
+        "오른쪽 범례에서 영화 이름을 **클릭하면 켜고 끌 수 있고**, **더블클릭하면 그 영화만** 볼 수 있어요."
     )
 
-    st.caption("오늘 자료는 아직 집계 전이라 **어제까지만** 고를 수 있습니다.")
+    # ① 영화별 일관객 합계를 구해서 상위 5편 뽑기
+    total_by_movie = df.groupby("영화명")["일관객"].sum().sort_values(ascending=False)
+    top5 = total_by_movie.head(5)
+    top5_names = top5.index.tolist()
 
-    st.divider()
-    st.header("ℹ️ 안내")
-    st.write(f"현재 한국 시각: **{dt.datetime.now(KST).strftime('%Y-%m-%d %H:%M')}**")
-    st.write("같은 날짜는 **1시간 동안** 저장해 두고 다시 사용합니다.")
+    # ② 상위 5편에 해당하는 행만 남기기
+    top5_df = df[df["영화명"].isin(top5_names)].sort_values(["영화명", "날짜"])
 
-    st.markdown(
-        """
-        **표 기호 읽는 법**
-        - 🔺 : 전날보다 순위 **상승**
-        - 🔻 : 전날보다 순위 **하락**
-        - ➖ : 변동 없음
-        - 🏆 : 누적관객 **100만 명** 돌파
-        """
+    # ③ 범례 순서를 관객수 많은 순으로 고정
+    fig = px.line(
+        top5_df,
+        x="날짜",
+        y="일관객",
+        color="영화명",
+        markers=True,
+        title="일관객 합계 TOP 5 영화의 날짜별 일관객 수",
+        labels={"날짜": "날짜", "일관객": "일별 관객수(명)", "영화명": "영화"},
+        category_orders={"영화명": top5_names},
+    )
+    fig.update_traces(
+        hovertemplate="%{fullData.name}<br>날짜: %{x|%Y-%m-%d}<br>관객수: %{y:,.0f}명<extra></extra>"
+    )
+    fig.update_layout(
+        hovermode="closest",
+        yaxis_tickformat=",",
+        legend=dict(
+            title="영화 (클릭: 켜기/끄기, 더블클릭: 혼자 보기)",
+            orientation="h",
+            yanchor="bottom",
+            y=-0.35,
+            xanchor="left",
+            x=0,
+        ),
     )
 
-    if st.button("🔄 캐시 지우고 다시 불러오기"):
-        st.cache_data.clear()   # 저장해 둔 결과를 모두 지움
-        st.rerun()              # 앱을 처음부터 다시 실행
+    st.plotly_chart(fig, use_container_width=True)
 
+    # ④ TOP 5 요약 표
+    with st.expander("📋 TOP 5 영화 요약 표 보기"):
+        summary = (
+            top5_df.groupby("영화명")
+            .agg(
+                일관객_합계=("일관객", "sum"),
+                최고_일관객=("일관객", "max"),
+                최고_기록일=("날짜", lambda s: s.loc[top5_df.loc[s.index, "일관객"].idxmax()].date()),
+                첫_등장일=("날짜", "min"),
+                마지막_등장일=("날짜", "max"),
+                진입_일수=("날짜", "count"),
+            )
+            .loc[top5_names]
+            .reset_index()
+        )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
 
-# ── 12) 고른 날짜를 API가 원하는 형태로 바꾸기 ───────────────
-# strftime("%Y%m%d") : date(2025, 6, 1) → "20250601"
-target_dt = selected_date.strftime("%Y%m%d")
-
-# 화면에 보기 좋은 형태(2025-06-01)
-pretty_date = selected_date.strftime("%Y-%m-%d")
-st.subheader(f"📅 {pretty_date} 박스오피스")
-
-
-# ── 13) 자료 불러오기 ────────────────────────────────────────
-result = fetch_boxoffice(target_dt, API_KEY)
-
-# (가) 목록이 비어 있는 경우 → '집계 전' 안내
-if result["status"] == "EMPTY":
-    st.warning(f"📭 {pretty_date}는 아직 집계 전입니다.")
-    st.markdown(
-        """
-        **이런 점을 확인해 보세요.**
-        - KOBIS 일별 자료는 보통 **다음 날 오전**에 갱신됩니다. 조금 뒤에 다시 시도해 보세요.
-        - 너무 오래된 날짜는 자료가 없을 수 있습니다.
-        - 왼쪽 사이드바에서 **다른 날짜**를 골라 보세요.
-        """
+    insight_box(
+        "예) 다섯 영화 모두 개봉 직후 정점을 찍고 감소하지만, 정점의 높이와 인기가 유지되는 기간은 영화마다 다르다."
     )
-    st.stop()
 
-# (나) 그 밖의 오류 → 원인과 확인 방법 안내
-if result["status"] == "ERROR":
-    st.error(f"⚠️ 자료를 가져오지 못했습니다.\n\n{result['error']}")
-    st.markdown(
-        """
-        **이런 점을 확인해 보세요.**
-        - **인증키**: KOBIS에서 발급받은 키가 맞는지, 앞뒤에 빈칸이 섞이지 않았는지 확인하세요.
-        - **키 상태**: 발급 직후에는 활성화까지 시간이 걸릴 수 있고, 일일 호출 한도를 넘으면 막힙니다.
-        - **네트워크**: 인터넷 연결 또는 KOBIS 서버 점검 여부를 확인하세요.
-        - 위 항목을 고친 뒤 왼쪽 사이드바의 **🔄 다시 불러오기** 버튼을 눌러 주세요.
-        """
+
+section_2_top5_compare(df)
+st.divider()
+
+
+# =============================================================
+# 구역 3 : 날짜별 10위권 일관객 합계 (영역 그래프 + 최고 3일 표시)
+# =============================================================
+def section_3_daily_total(df: pd.DataFrame):
+    st.header("3️⃣ 극장가 전체 흐름 — 날짜별 10위권 관객 합계")
+    st.write(
+        "하루하루 **10위권 영화 관객수를 모두 더한 값**을 영역 그래프로 그렸습니다. "
+        "1년 동안 극장가가 언제 붐볐고 언제 한산했는지 한눈에 볼 수 있어요. "
+        "가장 관객이 많았던 **상위 3일**은 그래프 위에 ★ 표시와 날짜를 적어 두었습니다."
     )
-    st.stop()
+
+    # ① 날짜별로 묶어서 일관객 합계 구하기
+    daily = (
+        df.groupby("날짜", as_index=False)["일관객"]
+        .sum()
+        .rename(columns={"일관객": "합계관객"})
+        .sort_values("날짜")
+        .reset_index(drop=True)
+    )
+
+    # ② 합계가 가장 컸던 3일 뽑기
+    top3 = daily.nlargest(3, "합계관객").sort_values("합계관객", ascending=False)
+
+    # ③ 영역 그래프 그리기
+    fig = px.area(
+        daily,
+        x="날짜",
+        y="합계관객",
+        title="날짜별 박스오피스 10위권 관객수 합계",
+        labels={"날짜": "날짜", "합계관객": "그날 10위권 관객수 합계(명)"},
+    )
+    fig.update_traces(
+        line=dict(width=1.5, color="#1f77b4"),
+        fillcolor="rgba(31, 119, 180, 0.25)",
+        hovertemplate="날짜: %{x|%Y-%m-%d}<br>합계: %{y:,.0f}명<extra></extra>",
+    )
+
+    # ④ 상위 3일에 ★ 마커와 날짜 라벨 얹기
+    fig.add_trace(
+        go.Scatter(
+            x=top3["날짜"],
+            y=top3["합계관객"],
+            mode="markers+text",
+            marker=dict(size=14, color="crimson", symbol="star",
+                        line=dict(width=1, color="white")),
+            text=[d.strftime("%Y-%m-%d") for d in top3["날짜"]],
+            textposition="top center",
+            textfont=dict(size=12, color="crimson"),
+            name="관객 최다 3일",
+            hovertemplate="🏆 %{x|%Y-%m-%d}<br>합계: %{y:,.0f}명<extra></extra>",
+            cliponaxis=False,
+        )
+    )
+
+    # ⑤ 라벨이 잘리지 않도록 y축 위쪽에 여유 주기
+    y_max = daily["합계관객"].max()
+    fig.update_layout(
+        hovermode="x unified",
+        yaxis_tickformat=",",
+        yaxis_range=[0, y_max * 1.18],
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ⑥ 최다 3일 정보 카드
+    st.markdown("**🏆 관객이 가장 많았던 3일**")
+    cols = st.columns(3)
+    medals = ["🥇", "🥈", "🥉"]
+    weekday_kr = ["월", "화", "수", "목", "금", "토", "일"]
+    for i, (col, (_, row)) in enumerate(zip(cols, top3.iterrows())):
+        d = row["날짜"]
+        col.metric(
+            label=f"{medals[i]} {d.strftime('%Y-%m-%d')} ({weekday_kr[d.weekday()]})",
+            value=f"{row['합계관객']:,.0f}명",
+        )
+
+    # ⑦ 그날 1위 영화가 무엇이었는지 확인해 보기
+    with st.expander("🔎 그 3일에 어떤 영화가 상위권이었을까?"):
+        detail = (
+            df[df["날짜"].isin(top3["날짜"])]
+            .sort_values(["날짜", "순위"])[["날짜", "순위", "영화명", "일관객", "스크린수"]]
+        )
+        detail["날짜"] = detail["날짜"].dt.strftime("%Y-%m-%d")
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+
+    insight_box(
+        "예) 관객수는 1년 내내 고르지 않고, 방학·연휴·대작 개봉 시기에 뾰족하게 솟아오른다."
+    )
 
 
-# ── 14) 표 만들기 ────────────────────────────────────────────
-df = build_dataframe(result["data"])
+section_3_daily_total(df)
+st.divider()
 
 
-# ── 15) 1위 영화를 지표 카드 세 장으로 크게 보여 주기 ────────
-st.markdown("### 🥇 1위 영화")
+# =============================================================
+# 구역 4 : 영화별 총관객 TOP 10 (가로 막대그래프)
+# =============================================================
+def section_4_top10_bar(df: pd.DataFrame):
+    st.header("4️⃣ 영화별 총관객 TOP 10")
+    st.write(
+        "이 기간 동안 각 영화가 10위권에서 모은 **일관객을 모두 더해** 상위 10편을 뽑았습니다. "
+        "막대에 마우스를 올리면 **10위권에 머문 날수**도 함께 볼 수 있어요."
+    )
 
-top_movie = df.iloc[0]   # iloc[0] = 표의 첫 번째 줄 = 1위
+    # ① 영화별로 합계관객 + 진입일수를 한 번에 계산
+    movie_stats = (
+        df.groupby("영화명")
+        .agg(
+            합계관객=("일관객", "sum"),
+            진입일수=("날짜", "nunique"),
+            최고일관객=("일관객", "max"),
+            최고순위=("순위", "min"),
+        )
+        .reset_index()
+    )
 
-col1, col2, col3 = st.columns(3)   # 화면을 가로로 3등분
+    # ② 합계관객 기준 TOP 10
+    top10 = movie_stats.nlargest(10, "합계관객").reset_index(drop=True)
 
-with col1:
-    st.metric(label="영화명", value=top_movie["영화명"])   # 트로피가 붙어 있으면 함께 표시
-with col2:
-    # f"{숫자:,}" : 천 단위마다 쉼표를 찍어 읽기 쉽게 만듭니다.
-    st.metric(label="당일 관객수", value=f"{top_movie['관객수']:,} 명")
-with col3:
-    st.metric(label="누적 관객수", value=f"{top_movie['누적관객']:,} 명")
+    # ③ 하루 평균 관객도 계산해 두기
+    top10["일평균관객"] = top10["합계관객"] / top10["진입일수"]
 
-st.caption(
-    f"개봉일: {top_movie['개봉일']} · "
-    f"스크린수: {top_movie['스크린수']:,}개 · "
-    f"전일 대비 순위: {top_movie['증감']}"
-)
+    # ④ 가로 막대그래프 — 관객 많은 영화가 위로 오게
+    #    (y축은 아래에서 위로 그려지므로, 적은 순서로 정렬해야 큰 값이 맨 위에 온다)
+    plot_df = top10.sort_values("합계관객", ascending=True)
+
+    fig = px.bar(
+        plot_df,
+        x="합계관객",
+        y="영화명",
+        orientation="h",
+        title="일관객 합계 TOP 10 영화",
+        labels={"합계관객": "총관객수(명)", "영화명": ""},
+        color="합계관객",
+        color_continuous_scale="Blues",
+        text="합계관객",
+        custom_data=["진입일수", "일평균관객", "최고일관객", "최고순위"],
+    )
+
+    # ⑤ 툴팁에 진입일수 등 추가 정보 넣기
+    fig.update_traces(
+        texttemplate="%{x:,.0f}",
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "총관객수: %{x:,.0f}명<br>"
+            "10위권에 든 날수: %{customdata[0]:,.0f}일<br>"
+            "하루 평균 관객: %{customdata[1]:,.0f}명<br>"
+            "최고 일관객: %{customdata[2]:,.0f}명<br>"
+            "최고 순위: %{customdata[3]:.0f}위"
+            "<extra></extra>"
+        ),
+    )
+
+    x_max = top10["합계관객"].max()
+    fig.update_layout(
+        xaxis_tickformat=",",
+        xaxis_range=[0, x_max * 1.15],   # 막대 끝 숫자가 잘리지 않도록 여유
+        height=520,
+        coloraxis_showscale=False,       # 색 막대(범례) 숨기기
+        margin=dict(l=10, r=10, t=60, b=10),
+        yaxis=dict(tickfont=dict(size=13)),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ⑥ 순위표
+    with st.expander("📋 TOP 10 순위표 보기"):
+        table = top10.copy()
+        table.insert(0, "순위", range(1, len(table) + 1))
+        table = table[["순위", "영화명", "합계관객", "진입일수", "일평균관객", "최고일관객", "최고순위"]]
+        st.dataframe(
+            table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "합계관객": st.column_config.NumberColumn("총관객수", format="%,d명"),
+                "진입일수": st.column_config.NumberColumn("10위권 날수", format="%d일"),
+                "일평균관객": st.column_config.NumberColumn("하루 평균", format="%,d명"),
+                "최고일관객": st.column_config.NumberColumn("최고 일관객", format="%,d명"),
+                "최고순위": st.column_config.NumberColumn("최고 순위", format="%d위"),
+            },
+        )
+
+    insight_box(
+        "예) 총관객이 많다고 해서 10위권에 오래 머문 것은 아니며, "
+        "짧고 굵게 흥행한 영화와 길게 버틴 영화가 나뉜다."
+    )
 
 
-# ── 16) 전체 순위 표 보여 주기 ───────────────────────────────
-st.markdown("### 📋 박스오피스 순위 (TOP 10)")
-
-# 화면에 보여 줄 열만 골라 냅니다. (밑줄 _ 로 시작하는 숨은 열은 제외)
-show_cols = ["순위", "증감", "영화명", "개봉일", "관객수", "누적관객", "스크린수"]
-
-st.dataframe(
-    df[show_cols],
-    use_container_width=True,   # 화면 너비에 맞춰 표를 넓게
-    hide_index=True,            # 왼쪽 0,1,2... 번호 숨기기
-    column_config={
-        "증감": st.column_config.TextColumn("전일대비", width="small"),
-        "관객수": st.column_config.NumberColumn("관객수", format="%d"),
-        "누적관객": st.column_config.NumberColumn("누적관객", format="%d"),
-        "스크린수": st.column_config.NumberColumn("스크린수", format="%d"),
-    },
-)
-
-# 100만 돌파 영화가 몇 편인지 세어 알려 줍니다.
-# (조건에 맞는 줄만 고르는 방법: df[조건] → 그 결과의 길이를 len()으로 셈)
-million_movies = df[df["누적관객"] >= MILLION]
-if len(million_movies) > 0:
-    names = ", ".join(million_movies["_원래영화명"].tolist())
-    st.success(f"🏆 누적관객 100만 명 돌파 작품 {len(million_movies)}편: {names}")
+section_4_top10_bar(df)
+st.divider()
 
 
-# ── 17) 관객수 상위 5편 막대그래프 ───────────────────────────
-st.markdown("### 📊 관객수 상위 5편")
+# =============================================================
+# 구역 5 : (준비 중) — 앞으로 그래프를 추가할 자리
+# =============================================================
+def section_5_placeholder(df: pd.DataFrame):
+    st.header("5️⃣ (다음 그래프 자리)")
+    st.write("여기에 새로운 그래프를 추가할 예정입니다.")
+    st.empty()
+    insight_box("")
 
-# 관객수 기준 내림차순으로 정렬한 뒤 위에서 5개만 자릅니다.
-top5 = df.sort_values("관객수", ascending=False).head(5)
 
-# st.bar_chart는 '표의 index'를 가로축 이름으로 사용합니다.
-# 그래프에는 트로피가 없는 원래 이름을 쓰는 편이 깔끔합니다.
-chart_data = top5.set_index("_원래영화명")[["관객수"]]
-chart_data.index.name = "영화명"   # 가로축 제목을 보기 좋게 바꿈
-
-st.bar_chart(chart_data)
-
-st.caption("가로축: 영화명 / 세로축: 해당 날짜 관객수(명)")
+section_5_placeholder(df)
